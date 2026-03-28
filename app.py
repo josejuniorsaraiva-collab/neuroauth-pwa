@@ -600,3 +600,124 @@ def recarregar_planilha(xlsx_path: Optional[str] = None):
         }
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail={"erro": "xlsx_nao_encontrado", "mensagem": str(e)})
+
+
+# ── MOTOR SHERLOCK IMPORTS ─────────────────────────────────────────────────────
+from motor_sherlock.sherlock_engine import run_sherlock, SherlockRequest
+from motor_sherlock.llm_client import LLMError
+
+
+# ── MOTOR SHERLOCK MODEL ───────────────────────────────────────────────────────
+
+class SherlockDecisaoRequest(BaseModel):
+    """
+    Payload de entrada para o Motor Sherlock.
+    Aceita texto clínico livre — o LLM extrai os parâmetros estruturados.
+    """
+    texto_clinico: str = Field(
+        ...,
+        min_length=20,
+        description="Texto clínico livre: laudo, indicação cirúrgica, resumo do caso, etc.",
+    )
+    convenio_id: str = Field(
+        ...,
+        description="ID do convênio (ex: UNIMED_CARIRI, BRADESCO_SAUDE). "
+                    "Deve existir na planilha-mãe ou ter fallback GLOBAL.",
+    )
+    episodio_id: Optional[str] = Field(
+        default=None,
+        description="ID do episódio do Motor 1, se este caso já foi criado.",
+    )
+    hospital_id: Optional[str] = Field(default=None)
+    cid_sugerido: Optional[str] = Field(
+        default=None,
+        description="CID-10 sugerido pelo solicitante. O Sherlock validará ou refinará.",
+    )
+    dados_clinicos: Optional[dict] = Field(
+        default=None,
+        description="Dados clínicos estruturados adicionais (ex: {niveis: 2, urgencia: false}).",
+    )
+    xlsx_path: Optional[str] = Field(
+        default=None,
+        description="Caminho para xlsx alternativo (debug). Padrão: PLANILHA_MAE_PATH env.",
+    )
+
+    model_config = {"extra": "allow"}
+
+
+# ── MOTOR SHERLOCK ENDPOINT ────────────────────────────────────────────────────
+
+@app.post("/sherlock/decisao", status_code=200, tags=["Motor Sherlock"])
+def sherlock_decisao(req: SherlockDecisaoRequest):
+    """
+    Motor Sherlock — Decisão de autorização a partir de texto clínico livre.
+
+    Pipeline em 3 fases:
+    1. **Extração**: LLM (claude-sonnet + Sherlock system prompt) analisa o texto clínico
+       e extrai parâmetros estruturados (profile, CID, níveis, caráter, OPME, etc.).
+    2. **Validação**: Motor 2 valida os parâmetros extraídos contra a planilha-mãe
+       (fonte de verdade determinística — códigos, regras, OPME, score).
+    3. **Síntese**: LLM sintetiza o artefato do Motor 2 em narrativa clínica legível.
+
+    Retorna:
+    - `status`: GO | GO_COM_RESSALVAS | NO_GO | ERRO
+    - `score`: score ponderado do Motor 2
+    - `artefato_motor2`: decisão completa com códigos, documentos, OPME
+    - `interpretacao_sherlock`: narrativa clínica gerada pelo LLM
+    - `parametros_extraidos`: o que o LLM extraiu do texto (auditoria)
+    - `confianca_extracao`: alta | media | baixa
+    - `ambiguidades`: incertezas identificadas pelo LLM para revisão humana
+    - `warnings`: alertas estruturais e clínicos acumulados
+
+    **Requer** `ANTHROPIC_API_KEY` configurada no ambiente.
+    """
+    sherlock_req = SherlockRequest(
+        texto_clinico=req.texto_clinico,
+        convenio_id=req.convenio_id,
+        episodio_id=req.episodio_id,
+        hospital_id=req.hospital_id,
+        cid_sugerido=req.cid_sugerido,
+        dados_clinicos=req.dados_clinicos,
+        xlsx_path=req.xlsx_path,
+    )
+
+    try:
+        result = run_sherlock(sherlock_req)
+    except Exception as e:
+        # Nunca deve chegar aqui — run_sherlock captura internamente,
+        # mas protegemos o endpoint de qualquer vazamento.
+        raise HTTPException(
+            status_code=500,
+            detail={"erro": "sherlock_fatal", "mensagem": str(e)},
+        )
+
+    response = result.to_dict()
+
+    # HTTP 503 se erro de planilha ausente
+    if result.status == "ERRO":
+        erro = result.erro or ""
+        if "planilha" in erro.lower() or "não encontrada" in erro.lower():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "erro": "planilha_mae_nao_encontrada",
+                    "mensagem": erro,
+                    "dica": "Defina PLANILHA_MAE_PATH com o caminho do xlsx no servidor",
+                },
+            )
+        if "ANTHROPIC_API_KEY" in erro or "anthropic" in erro.lower():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "erro": "llm_nao_configurado",
+                    "mensagem": erro,
+                    "dica": "Defina ANTHROPIC_API_KEY no ambiente do servidor",
+                },
+            )
+        # Outros erros → 422 (dados insuficientes para processar)
+        raise HTTPException(
+            status_code=422,
+            detail={"erro": "sherlock_error", "mensagem": erro, "detalhes": response},
+        )
+
+    return response
