@@ -211,6 +211,11 @@ def health():
         "timestamp": _now(),
     }
 
+@app.get('/version-debug')
+def version_debug():
+    return {'file': __file__, 'version': '1.1.0-debug', 'relay_exists': True}
+
+
 
 @app.get("/episodios")
 def listar_episodios(limite: int = 20):
