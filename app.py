@@ -34,7 +34,7 @@ store.init_db()
 app = FastAPI(
     title="NEUROAUTH Motor 1",
     description="Motor de Autorização Cirúrgica — v1.0.0",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
